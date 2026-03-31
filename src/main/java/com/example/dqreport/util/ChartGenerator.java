@@ -15,6 +15,7 @@ import org.jfree.data.time.TimeSeries;
 import org.jfree.data.time.TimeSeriesCollection;
 
 import java.awt.Color;
+import java.awt.Font;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -25,6 +26,10 @@ import java.util.List;
 import java.util.Map;
 
 public final class ChartGenerator {
+
+    private static final Font TITLE_FONT = pickFont(Font.BOLD, 18);
+    private static final Font LABEL_FONT = pickFont(Font.PLAIN, 12);
+    private static final Font TICK_FONT = pickFont(Font.PLAIN, 11);
 
     private ChartGenerator() {
     }
@@ -41,7 +46,10 @@ public final class ChartGenerator {
         }
 
         JFreeChart chart = ChartFactory.createPieChart(title, dataset, true, false, false);
+        applyCommonFont(chart);
+
         PiePlot<?> plot = (PiePlot<?>) chart.getPlot();
+        plot.setLabelFont(LABEL_FONT);
         plot.setSectionOutlinesVisible(false);
         plot.setBackgroundPaint(Color.WHITE);
         plot.setShadowPaint(null);
@@ -65,6 +73,7 @@ public final class ChartGenerator {
 
         TimeSeriesCollection dataset = new TimeSeriesCollection(series);
         JFreeChart chart = ChartFactory.createTimeSeriesChart(title, "日期", "数量", dataset, false, false, false);
+        applyCommonFont(chart);
 
         XYPlot plot = chart.getXYPlot();
         plot.setBackgroundPaint(Color.WHITE);
@@ -73,9 +82,13 @@ public final class ChartGenerator {
 
         DateAxis domainAxis = (DateAxis) plot.getDomainAxis();
         domainAxis.setDateFormatOverride(new SimpleDateFormat("MM-dd"));
+        domainAxis.setLabelFont(LABEL_FONT);
+        domainAxis.setTickLabelFont(TICK_FONT);
 
         NumberAxis rangeAxis = (NumberAxis) plot.getRangeAxis();
         rangeAxis.setStandardTickUnits(NumberAxis.createIntegerTickUnits());
+        rangeAxis.setLabelFont(LABEL_FONT);
+        rangeAxis.setTickLabelFont(TICK_FONT);
 
         XYLineAndShapeRenderer renderer = (XYLineAndShapeRenderer) plot.getRenderer();
         renderer.setSeriesShapesVisible(0, false);
@@ -84,5 +97,35 @@ public final class ChartGenerator {
         File outputFile = outputDir.resolve(fileName).toFile();
         ChartUtils.saveChartAsPNG(outputFile, chart, 960, 420);
         return outputFile;
+    }
+
+    private static void applyCommonFont(JFreeChart chart) {
+        if (chart.getTitle() != null) {
+            chart.getTitle().setFont(TITLE_FONT);
+        }
+        if (chart.getLegend() != null) {
+            chart.getLegend().setItemFont(LABEL_FONT);
+        }
+    }
+
+    private static Font pickFont(int style, int size) {
+        String[] candidates = {
+                "Noto Sans CJK SC",
+                "Noto Sans CJK CN",
+                "WenQuanYi Zen Hei",
+                "Source Han Sans SC",
+                "Microsoft YaHei",
+                "SimHei",
+                "SansSerif"
+        };
+
+        for (String name : candidates) {
+            Font font = new Font(name, style, size);
+            if (font.canDisplay('中')) {
+                return font;
+            }
+        }
+
+        return new Font("SansSerif", style, size);
     }
 }
