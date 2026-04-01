@@ -1600,3 +1600,279 @@ redis-cli CLIENT LIST | grep 'flags=P\|sub=[1-9]\|psub=[1-9]' | head -n 50
 > **先确认内存是不是耗在连接和缓冲区，再定位来源 IP，再回到业务代码修复连接管理。**
 
 继续单纯增大 `maxmemory`，通常不是治本，只是延后再次出事。
+
+---
+
+## 26. 专项场景：为什么“重启后也没有下降”
+
+这是一个非常关键的现象，不能简单理解为“Redis 里旧数据没有释放”。
+
+### 26.1 先区分你看到的是哪种“没下降”
+
+实际排障时，常见有三种“看起来没降”：
+
+#### 类型 A：`used_memory` 本身就没怎么降
+含义：
+- Redis 内部仍然有大量内存占用
+- 可能是数据加载回来了
+- 也可能是客户端连接/缓冲很快又打满了
+
+#### 类型 B：`used_memory` 降了，但 `used_memory_rss` 没明显降
+含义：
+- Redis 逻辑使用量下降了
+- 但进程 RSS 没立刻归还给操作系统
+- 常见原因是 jemalloc/内存分配器、碎片、页保留
+
+#### 类型 C：Redis 重启后很快又回到高内存
+含义：
+- 不是“重启没用”
+- 而是“上游问题重新把 Redis 打回高位”
+- 这是连接泄漏、短连接风暴、重连风暴里非常典型的现象
+
+---
+
+### 26.2 为什么重启后仍然可能很快恢复到异常状态
+
+常见原因：
+
+1. **应用自动重连**
+   - Redis 一起来，上游所有实例同时连回去
+
+2. **连接泄漏仍未修复**
+   - 重启 Redis 只是清空了旧连接
+   - 但应用逻辑没变，连接会继续泄漏
+
+3. **短连接/重连风暴仍存在**
+   - 重启后短时间内 `total_connections_received` 激增
+
+4. **持久化数据被重新加载**
+   - RDB/AOF 恢复后，数据重新进入内存
+   - 但如果你的 key 很少、小 key 为主，一般不会是 5G 级别主因
+
+5. **输出缓冲重新堆积**
+   - 某些慢客户端一连上来又开始积压
+
+---
+
+### 26.3 重启后应该立即采集什么
+
+建议在 **Redis 重启后的 1 分钟、3 分钟、5 分钟** 各采一次：
+
+```bash
+redis-cli INFO memory
+redis-cli INFO clients
+redis-cli INFO stats
+redis-cli MEMORY STATS
+redis-cli CLIENT LIST | head -n 30
+redis-cli CLIENT LIST | awk -F'addr=| ' '{print $2}' | cut -d: -f1 | sort | uniq -c | sort -nr | head -n 20
+ss -ant | grep ':6379' | awk '{print $1}' | sort | uniq -c
+```
+
+### 重点看什么
+
+#### 指标 1：`connected_clients`
+- 是否在几分钟内快速增长
+- 如果增长很快，说明上游正在重新打连接
+
+#### 指标 2：`total_connections_received`
+- 是否在短时间内激增
+- 如果是，说明存在短连接/重连风暴
+
+#### 指标 3：`used_memory_overhead`
+- 是否远高于 `used_memory_dataset`
+- 如果是，说明内存主要耗在连接与 Redis 自身开销
+
+#### 指标 4：来源 IP TOP
+- 是否某几个来源在重启后立刻占满
+- 如果是，基本可以锁定问题机器/服务
+
+#### 指标 5：`omem`
+- 是否重新出现较大输出缓冲
+- 如果是，说明慢客户端/订阅问题继续存在
+
+---
+
+### 26.4 如何判断是“RSS 假象”还是“真实占用回来了”
+
+#### 如果你看到：
+- `used_memory` 不高
+- `used_memory_dataset` 不高
+- `used_memory_overhead` 也不高
+- 但 `used_memory_rss` 高
+
+结论：
+- 更像是 RSS / 内存分配器 / 碎片观感问题
+- 不是 Redis 活跃数据真的还那么大
+
+#### 如果你看到：
+- `used_memory` 很高
+- `used_memory_overhead` 很高
+- `connected_clients` 也高
+
+结论：
+- 这是连接/客户端问题真实回来了
+- 不是“显示错觉”
+
+---
+
+### 26.5 重启后不下降时的优先动作
+
+1. **马上看来源 IP TOP**
+2. **马上看 `connected_clients` 和 `total_connections_received`**
+3. **对最可疑来源做隔离实验**
+4. **不要继续单纯放大 `maxmemory`**
+
+---
+
+### 26.6 最有效的验证实验
+
+如果你已经从 `CLIENT LIST` / `ss` 中看到某个来源 IP 很可疑：
+
+- 重启 Redis 后
+- 先临时切断这台应用机器到 Redis 的访问
+- 观察 3~5 分钟内：
+  - `connected_clients` 是否明显变缓
+  - `used_memory` 是否不再快速上涨
+  - `total_connections_received` 是否明显下降
+
+#### 结果解释
+
+- **明显缓和**：该机器/服务就是高优先级嫌疑对象
+- **没有变化**：继续看下一个来源 IP
+
+---
+
+### 26.7 对你当前案例的解释倾向
+
+如果同时满足：
+
+- key 少
+- 小 key 为主
+- 连接数极高
+- 调大 `maxmemory` 只是延缓故障
+- 重启后很快又“不下降”或“重新涨回去”
+
+那么最应该优先怀疑：
+
+> 不是 Redis 自己“存住了很多旧垃圾”，而是上游应用在 Redis 重启后继续把异常连接/请求重新灌回来。
+
+---
+
+## 27. 一键巡检脚本说明：`redis_check.sh`
+
+项目内已附带脚本：
+
+- `redis_check.sh`
+
+### 27.1 脚本作用
+
+该脚本会一次性采集：
+
+- `INFO memory`
+- `INFO clients`
+- `INFO stats`
+- `INFO persistence`
+- `MEMORY STATS`
+- `DBSIZE`
+- `CONFIG GET` 关键配置
+- `CLIENT LIST` 抽样和完整列表
+- 按来源 IP 聚合的连接 TOP
+- `omem/qbuf` 非 0 客户端抽样
+- 系统层 `ss` 连接状态统计
+- Redis 进程与主机内存占用概览
+
+适合：
+- 故障现场快速打包证据
+- 重启前后各跑一次对比
+- 内网环境离线保存和传阅
+
+---
+
+### 27.2 使用方法
+
+默认连接本机 127.0.0.1:6379：
+
+```bash
+./redis_check.sh
+```
+
+指定输出目录：
+
+```bash
+./redis_check.sh ./redis-check-output
+```
+
+指定 Redis 地址：
+
+```bash
+REDIS_HOST=10.0.0.5 REDIS_PORT=6379 ./redis_check.sh
+```
+
+带密码：
+
+```bash
+REDIS_HOST=10.0.0.5 REDIS_PORT=6379 REDIS_PASSWORD='yourpass' ./redis_check.sh
+```
+
+---
+
+### 27.3 脚本输出文件说明
+
+脚本会生成一个目录，里面常见文件有：
+
+- `info_memory.txt`
+- `info_clients.txt`
+- `info_stats.txt`
+- `info_persistence.txt`
+- `memory_stats.txt`
+- `dbsize.txt`
+- `config_maxmemory.txt`
+- `config_maxmemory_policy.txt`
+- `config_maxclients.txt`
+- `config_timeout.txt`
+- `config_tcp_keepalive.txt`
+- `client_list_head.txt`
+- `client_list_full.txt`
+- `client_ip_top.txt`
+- `client_omem_nonzero.txt`
+- `ss_state_count.txt`
+- `ss_ip_top.txt`
+- `ps_redis.txt`
+- `top_mem.txt`
+- `README.txt`
+
+---
+
+### 27.4 推荐使用方式
+
+#### 场景 A：故障发生时立即执行
+目的：
+- 固化现场证据
+
+#### 场景 B：Redis 重启后 1~3 分钟再执行一次
+目的：
+- 比较重启前后连接来源、连接增长速度、内存结构是否快速恢复异常
+
+#### 场景 C：隔离某个可疑应用实例后再执行一次
+目的：
+- 验证该实例是否为根因来源
+
+---
+
+### 27.5 重启前后对比建议
+
+建议至少保留两份：
+
+- `redis-check-before-restart`
+- `redis-check-after-restart`
+
+重点比对：
+
+- `connected_clients`
+- `total_connections_received`
+- `used_memory_overhead`
+- `clients.normal`
+- `client_ip_top.txt`
+- `ss_ip_top.txt`
+
+如果重启后这些指标很快重新异常，说明问题来自上游持续输入，而非 Redis 重启失效。
