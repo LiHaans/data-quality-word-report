@@ -1,0 +1,15 @@
+{
+  "base_url": "http://127.0.0.1:8317",
+  "api_key": "请替换为你的CPA管理Key",
+  "src_dir": "/opt/software/xx/token",
+  "backup_dir": "/opt/software/xx/token_backup",
+  "file_glob": "*.json",
+  "name_mode": "original",
+  "name_prefix": "",
+  "request_timeout": 30,
+  "verify_tls": true,
+  "recursive": false,
+  "archive_by_date": true,
+  "delete_after_upload": true,
+  "include_hidden": false
+}

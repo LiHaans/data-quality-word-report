@@ -1,0 +1,37 @@
+# cron 示例
+
+## 每 5 分钟执行一次
+
+```cron
+*/5 * * * * /usr/bin/python3 /root/clawd/code/data-quality-word-report/cpa_token_uploader.py --config /root/.cpa_token_uploader.json >> /var/log/cpa_token_uploader.log 2>&1
+```
+
+## 每 1 分钟执行一次（仅在目录文件量很小且接口稳定时考虑）
+
+```cron
+* * * * * /usr/bin/python3 /root/clawd/code/data-quality-word-report/cpa_token_uploader.py --config /root/.cpa_token_uploader.json >> /var/log/cpa_token_uploader.log 2>&1
+```
+
+## 首次上线建议
+
+先把配置里的：
+
+- `delete_after_upload`: `false`
+
+先观察几轮，确认上传正常，再改成：
+
+- `delete_after_upload`: `true`
+
+## 常用手动命令
+
+### dry-run
+
+```bash
+python3 /root/clawd/code/data-quality-word-report/cpa_token_uploader.py --config /root/.cpa_token_uploader.json --dry-run
+```
+
+### 正式执行
+
+```bash
+python3 /root/clawd/code/data-quality-word-report/cpa_token_uploader.py --config /root/.cpa_token_uploader.json
+```
