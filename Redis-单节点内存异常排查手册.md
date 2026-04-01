@@ -1091,3 +1091,512 @@ redis-cli CONFIG SET timeout 300
 结合你当前信息，后者概率显著更高。
 
 如果后续你把现场命令输出补齐，这份手册就可以继续往下收敛成“哪一台机器、哪一个服务、哪一段代码”导致的问题。
+
+---
+
+## 15. 内网一次性导入版补充
+
+本章节用于增强离线可用性，目标是：
+
+- 让手册在**没有外网、不能临时搜索资料**的环境里也足够用
+- 让排障人员可以按“现象 -> 命令 -> 判断 -> 动作”直接执行
+- 尽量减少二次导入文档的需要
+
+---
+
+## 16. 五分钟速查版（适合故障现场先看）
+
+如果你正在故障现场，先不要全篇慢慢读，先执行下面这些命令：
+
+```bash
+redis-cli INFO memory
+redis-cli INFO clients
+redis-cli INFO stats
+redis-cli MEMORY STATS
+redis-cli DBSIZE
+redis-cli CLIENT LIST | head -n 30
+redis-cli CLIENT LIST | awk -F'addr=| ' '{print $2}' | cut -d: -f1 | sort | uniq -c | sort -nr | head -n 20
+ss -ant | grep ':6379' | awk '{print $1}' | sort | uniq -c
+ss -ant | grep ':6379' | awk '{print $5}' | cut -d: -f1 | sort | uniq -c | sort -nr | head -n 20
+```
+
+### 五分钟判断口诀
+
+#### 情况 1：`DBSIZE` 小，`used_memory_overhead` 大
+结论：
+- 先别怀疑数据本身
+- 优先查连接、缓冲区、客户端行为
+
+#### 情况 2：`connected_clients` 特别大
+结论：
+- 先查来源 IP
+- 再查是否连接泄漏 / 未用连接池 / 重连风暴
+
+#### 情况 3：`client_recent_max_output_buffer` 大，`CLIENT LIST` 里 `omem` 大
+结论：
+- 优先查慢客户端、订阅、输出缓冲积压
+
+#### 情况 4：`TIME-WAIT` 很多
+结论：
+- 优先查短连接频繁创建
+
+#### 情况 5：`ESTAB` 特别多，且大量空闲
+结论：
+- 优先查连接泄漏或连接池回收失效
+
+---
+
+## 17. 应急止血命令清单
+
+> 注意：以下命令适合故障止血，但执行前要确认业务影响。
+
+### 17.1 限制最大连接数
+
+```bash
+redis-cli CONFIG SET maxclients 20000
+```
+
+用途：
+- 避免 Redis 被异常连接持续打满
+
+风险：
+- 超出上限的新连接会被拒绝，部分业务可能报错
+
+---
+
+### 17.2 自动清理空闲连接
+
+```bash
+redis-cli CONFIG SET timeout 300
+```
+
+用途：
+- 自动关闭空闲超过 300 秒的连接
+
+风险：
+- 如果你的业务依赖长期空闲长连接，可能触发重连
+
+---
+
+### 17.3 查看当前最大连接和空闲超时配置
+
+```bash
+redis-cli CONFIG GET maxclients
+redis-cli CONFIG GET timeout
+redis-cli CONFIG GET tcp-keepalive
+```
+
+---
+
+### 17.4 按来源杀异常客户端（谨慎）
+
+先查样本：
+
+```bash
+redis-cli CLIENT LIST | grep 'addr=10.0.0.8:' | head -n 20
+```
+
+单个连接踢除：
+
+```bash
+redis-cli CLIENT KILL 10.0.0.8:53211
+```
+
+用途：
+- 验证某个来源是否为异常制造者
+
+风险：
+- 会中断对应业务连接
+
+---
+
+### 17.5 网络层先切异常来源
+
+如果明确某个 IP 异常，优先：
+- 下线对应应用实例
+- 或通过防火墙/安全组临时隔离
+
+这是比持续加大 `maxmemory` 更有效的止血动作。
+
+---
+
+## 18. 按现象定位问题
+
+### 18.1 现象：Key 很少，但 Redis 内存很高
+优先怀疑：
+- 连接开销
+- 输出缓冲区
+- Redis 元数据/overhead
+- 内存碎片（次级怀疑）
+
+先执行：
+
+```bash
+redis-cli INFO memory
+redis-cli MEMORY STATS
+redis-cli INFO clients
+```
+
+---
+
+### 18.2 现象：连接数不断上涨，从不回落
+优先怀疑：
+- 连接泄漏
+- 连接池没有回收
+- 某服务实例没有释放 Redis 连接
+
+先执行：
+
+```bash
+redis-cli INFO clients
+redis-cli CLIENT LIST | head -n 50
+redis-cli CLIENT LIST | awk -F'addr=| ' '{print $2}' | cut -d: -f1 | sort | uniq -c | sort -nr | head -n 20
+```
+
+重点看：
+- `age`
+- `idle`
+- `addr`
+
+---
+
+### 18.3 现象：连接数波动剧烈，同时 `TIME-WAIT` 很多
+优先怀疑：
+- 短连接模式
+- 重连风暴
+- 网络抖动后客户端无脑重试
+
+先执行：
+
+```bash
+redis-cli INFO stats
+ss -ant | grep ':6379' | awk '{print $1}' | sort | uniq -c
+```
+
+重点看：
+- `total_connections_received`
+- `TIME-WAIT`
+
+---
+
+### 18.4 现象：Redis 内存高，但 ops 并不高
+优先怀疑：
+- 连接长期挂着不干活
+- 空闲连接太多
+- 订阅连接堆积
+
+先执行：
+
+```bash
+redis-cli INFO stats
+redis-cli INFO clients
+redis-cli CLIENT LIST | head -n 50
+```
+
+重点看：
+- `instantaneous_ops_per_sec`
+- `connected_clients`
+- `idle`
+
+---
+
+### 18.5 现象：订阅/消息场景下内存涨得快
+优先怀疑：
+- 消费者慢
+- Pub/Sub 输出缓冲堆积
+
+先执行：
+
+```bash
+redis-cli INFO clients
+redis-cli CLIENT LIST | grep 'flags=P\|sub=[1-9]\|psub=[1-9]' | head -n 50
+```
+
+重点看：
+- `flags=P`
+- `sub`
+- `psub`
+- `omem`
+- `oll`
+
+---
+
+## 19. 配置项建议值（参考，不是绝对值）
+
+> 以下是单节点内网 Redis 的一般建议，具体仍要结合你的业务峰值和连接模型。
+
+### 19.1 `maxclients`
+建议：
+- 不要无限大
+- 通常应按“实例数 × 每实例连接池上限 × 冗余系数”估算
+
+例如：
+- 20 个应用实例
+- 每实例最大 200 连接
+- 冗余系数 2
+
+则上限可先估：
+- `20 × 200 × 2 = 8000`
+
+再结合现场调到 10000 或 12000，通常比“放任几百万连接”靠谱得多。
+
+---
+
+### 19.2 `timeout`
+建议：
+- 若业务允许，可设置 60~300 秒
+- 如果必须使用长期空闲连接，要确认客户端保活和池回收策略
+
+---
+
+### 19.3 `tcp-keepalive`
+建议：
+- 不要关闭
+- 常见可用值：60 或 300
+
+作用：
+- 帮助识别死连接、半开连接
+
+---
+
+### 19.4 `maxmemory-policy`
+常见建议：
+- 如果业务不能接受写失败，可评估 `allkeys-lru` / `volatile-lru`
+- 如果你的 Redis 更像缓存而非强一致存储，不建议长期 `noeviction`
+
+但注意：
+- 连接问题**不能靠淘汰策略解决**
+
+---
+
+## 20. 业务代码排查清单（按语言）
+
+### 20.1 Java（Jedis / Lettuce / Spring Data Redis）
+
+重点检查：
+- 是否每次请求都创建新连接
+- 是否启用连接池
+- 连接池 `maxTotal` / `maxIdle` / `minIdle` 是否合理
+- 异常流程是否归还连接
+- 是否有定时任务/批处理重复初始化 Redis 客户端
+
+常见错误信号：
+- `new Jedis(host, port)` 在业务方法里频繁出现
+- 每次请求 `new RedisClient()` / `connect()`
+- 没有统一 Bean / 单例注入
+
+建议：
+- Spring 项目统一由容器管理 Redis 客户端
+- 检查连接池借用归还监控
+- 给连接打 `clientName`
+
+---
+
+### 20.2 Go（go-redis / redigo）
+
+重点检查：
+- 是否反复 `NewClient()`
+- 是否每次操作都 `Dial()`
+- 是否启用了 `PoolSize`、`MinIdleConns`
+- 是否在 goroutine 中无限创建客户端
+
+常见错误信号：
+- 工具函数里每次都初始化 client
+- worker 数量和连接池大小完全失控
+
+建议：
+- Redis client 做成进程级单例
+- 限制池大小
+- 加入连接数和重试次数监控
+
+---
+
+### 20.3 Python（redis-py）
+
+重点检查：
+- 是否每次请求都 `redis.Redis(...)`
+- 是否复用了 `ConnectionPool`
+- 是否在脚本/任务循环中不断创建 client
+
+常见错误信号：
+- 业务函数内直接 new client
+- celery / 定时任务每轮循环重新初始化客户端
+
+建议：
+- 使用全局连接池
+- 检查任务重试与连接释放
+
+---
+
+### 20.4 Node.js（ioredis / node-redis）
+
+重点检查：
+- 是否每个请求都 `new Redis()`
+- 是否 Web 请求生命周期中重复初始化 client
+- 是否在消息消费者中反复建连
+- 是否断线后采用无上限立即重连
+
+常见错误信号：
+- controller / handler 内部 `new Redis()`
+- 一个模块被多次 import 后重复初始化客户端
+
+建议：
+- Redis 客户端做成模块级单例
+- 重连使用退避策略
+- 配置 client name
+
+---
+
+## 21. 现场采集模板（适合离线保存）
+
+把下面内容复制成现场记录文件，排障时直接填：
+
+```markdown
+# Redis 现场排障记录
+
+## 一、基础信息
+- 时间：
+- 主机：
+- Redis 版本：
+- 部署模式：单节点
+- 监听端口：6379
+- maxmemory：
+- maxmemory-policy：
+- maxclients：
+- timeout：
+- tcp-keepalive：
+
+## 二、异常现象
+- 现象开始时间：
+- 当前 used_memory：
+- 当前 used_memory_rss：
+- 当前 used_memory_dataset：
+- 当前 used_memory_overhead：
+- 当前 connected_clients：
+- 当前 blocked_clients：
+- 当前 DBSIZE：
+- 当前 ops/s：
+
+## 三、连接来源 TOP
+- 1.
+- 2.
+- 3.
+- 4.
+- 5.
+
+## 四、CLIENT LIST 抽样
+- 来源 IP：
+- age：
+- idle：
+- cmd：
+- flags：
+- omem：
+- tot-mem：
+
+## 五、系统连接状态
+- ESTAB：
+- TIME-WAIT：
+- CLOSE-WAIT：
+- SYN-RECV：
+
+## 六、初步判断
+- 
+
+## 七、已执行止血动作
+- 
+
+## 八、怀疑的业务服务
+- 
+
+## 九、后续整改项
+- 
+```
+
+---
+
+## 22. 常见误判
+
+### 22.1 误判：Key 少就说明 Redis 不可能占很多内存
+错误原因：
+- Redis 内存不只有数据，还有连接、缓冲区、元数据、碎片
+
+正确理解：
+- Key 少只能说明“未必是数据量膨胀”，不能排除连接问题
+
+---
+
+### 22.2 误判：调大 `maxmemory` 就是解决了
+错误原因：
+- 只是延后了故障触发时间
+
+正确理解：
+- 如果根因是连接问题，不修业务，内存还会继续涨
+
+---
+
+### 22.3 误判：`connected_clients` 高就是 Redis 自身 bug
+错误原因：
+- 大多数情况下是上游接入方式不合理
+
+正确理解：
+- Redis 更像“受害者”，真正问题通常在客户端行为
+
+---
+
+### 22.4 误判：只有大 key 才会导致内存问题
+错误原因：
+- 慢客户端、连接泄漏、缓冲堆积都能导致大内存
+
+---
+
+## 23. 建议增加的长期机制
+
+### 23.1 连接审计
+建议让每个服务：
+- 配置 `clientName`
+- 在监控里上报实例名
+- 记录连接池大小、空闲数、借出数
+
+### 23.2 周期巡检
+建议每周至少巡检：
+- `connected_clients`
+- `used_memory_overhead`
+- `clients.normal`
+- 来源 IP TOP
+- `total_connections_received` 增长速度
+
+### 23.3 基线建立
+建议记录正常时：
+- 平均连接数
+- 峰值连接数
+- 正常 ops/s
+- 正常 dataset/overhead 比例
+
+后续一旦偏离基线，就能更快发现异常。
+
+---
+
+## 24. 建议的离线附件清单
+
+如果你准备一次性导入内网环境，建议把下面这些一起带进去：
+
+1. 本手册 Markdown
+2. Redis 常用巡检脚本（shell）
+3. 一份业务语言对应的 Redis 连接池规范
+4. 现场记录模板
+5. 你的 Redis 当前配置备份
+
+如果后续需要，我还可以继续补：
+- `redis_check.sh` 巡检脚本
+- `redis_emergency_commands.md` 应急命令卡片
+- Java / Go / Python / Node 的连接池规范模板
+
+---
+
+## 25. 一句话结论
+
+对于“单节点 Redis、Key 少但内存暴涨、连接数高得离谱”的场景，最有效的排查路线是：
+
+> **先确认内存是不是耗在连接和缓冲区，再定位来源 IP，再回到业务代码修复连接管理。**
+
+继续单纯增大 `maxmemory`，通常不是治本，只是延后再次出事。
